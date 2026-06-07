@@ -1,0 +1,9 @@
+build/
+bin/
+*.o
+*.out
+*.log
+pacman
+.cache/
+.vscode/
+.DS_Store
