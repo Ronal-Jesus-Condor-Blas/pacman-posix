@@ -29,6 +29,51 @@ static int unlock_mutex(pthread_mutex_t *mutex, const char *name)
     return PACMAN_OK;
 }
 
+static int wait_done(sem_t *done_sem)
+{
+    while (sem_wait(done_sem) != 0) {
+        if (errno != EINTR) {
+            perror("sem_wait");
+            return PACMAN_ERROR;
+        }
+    }
+
+    return PACMAN_OK;
+}
+
+static int post_turn(sem_t *turn_sem)
+{
+    if (sem_post(turn_sem) != 0) {
+        perror("sem_post");
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int dispatch_selected_process(shared_state_t *state, SchedulerProcess selected)
+{
+    if (selected == SCHEDULER_PROCESS_PACMAN) {
+        if (post_turn(&state->sem_pacman_turn) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+        if (wait_done(&state->sem_p1_done) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+        printf("[P0] P1 confirmo fin de turno\n");
+        return PACMAN_OK;
+    }
+
+    if (post_turn(&state->sem_enemy_turn) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+    if (wait_done(&state->sem_p2_done) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+    printf("[P0] P2 confirmo fin de turno\n");
+    return PACMAN_OK;
+}
+
 static int is_priority_in_range(int priority)
 {
     return priority >= MIN_PRIORITY && priority <= MAX_PRIORITY;
@@ -177,6 +222,84 @@ int scheduler_run_dry(Scheduler *scheduler)
     return PACMAN_OK;
 }
 
+int scheduler_run(Scheduler *scheduler)
+{
+    shared_state_t *state = scheduler->state;
+
+    printf("[P0] Scheduler P0 iniciado.\n");
+
+    while (1) {
+        SchedulerProcess selected;
+
+        if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+
+        if (state->global_tick >= state->max_ticks) {
+            if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+                return PACMAN_ERROR;
+            }
+            break;
+        }
+
+        ++state->global_tick;
+
+        if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+
+        if (scheduler_apply_priority_requests(scheduler) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+
+        if (scheduler_select_next_process(scheduler, &selected) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+
+        if (scheduler_print_tick_log(state, selected) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+
+        if (dispatch_selected_process(state, selected) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+    }
+
+    if (scheduler_request_shutdown(scheduler) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    printf("[P0] Scheduler P0 finalizado.\n");
+    return PACMAN_OK;
+}
+
+int scheduler_request_shutdown(Scheduler *scheduler)
+{
+    shared_state_t *state = scheduler->state;
+
+    if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    state->game_over = 1;
+
+    if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    printf("[P0] game_over=1, esperando hijos...\n");
+
+    if (post_turn(&state->sem_pacman_turn) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    if (post_turn(&state->sem_enemy_turn) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
 int scheduler_print_tick_log(shared_state_t *state, SchedulerProcess selected)
 {
     int global_tick;
@@ -202,7 +325,7 @@ int scheduler_print_tick_log(shared_state_t *state, SchedulerProcess selected)
         return PACMAN_ERROR;
     }
 
-    printf("[tick %d/%d] prioridad_pacman=%d prioridad_enemy=%d seleccionado=%s\n",
+    printf("[P0][tick %d/%d] prioridad_pacman=%d prioridad_enemy=%d seleccionado=%s\n",
            global_tick,
            max_ticks,
            pacman_priority,

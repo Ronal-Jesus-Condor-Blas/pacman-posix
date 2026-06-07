@@ -6,6 +6,7 @@
 #include "../include/common.h"
 #include "../include/map.h"
 #include "../include/movement.h"
+#include "../include/processes.h"
 #include "../include/scheduler.h"
 #include "../include/shared.h"
 
@@ -76,6 +77,7 @@ int main(int argc, char *argv[])
     Map map = {0};
     SharedMemory shared = {0};
     Scheduler scheduler = {0};
+    ProcessHandles processes = {0};
     MovementInput movement_inputs[] = {
         {"pacman_moves.txt", "pacman_moves.txt", {0}},
         {"ghost_1_moves.txt", "ghost_1_moves.txt", {0}},
@@ -84,6 +86,8 @@ int main(int argc, char *argv[])
         {"ghost_4_moves.txt", "ghost_4_moves.txt", {0}},
     };
     const size_t movement_count = sizeof(movement_inputs) / sizeof(movement_inputs[0]);
+
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     if (argc != 3) {
         fprintf(stderr, "Uso: %s <case_dir> <max_ticks>\n", argv[0]);
@@ -127,7 +131,24 @@ int main(int argc, char *argv[])
     shared_state_print_summary(shared.state);
 
     scheduler_init(&scheduler, shared.state);
-    if (scheduler_run_dry(&scheduler) != PACMAN_OK) {
+
+    if (processes_start(shared.state, &processes) != PACMAN_OK) {
+        scheduler_request_shutdown(&scheduler);
+        processes_wait(&processes);
+        shared_memory_release(&shared);
+        map_free(&map);
+        return EXIT_FAILURE;
+    }
+
+    if (scheduler_run(&scheduler) != PACMAN_OK) {
+        scheduler_request_shutdown(&scheduler);
+        processes_wait(&processes);
+        shared_memory_release(&shared);
+        map_free(&map);
+        return EXIT_FAILURE;
+    }
+
+    if (processes_wait(&processes) != PACMAN_OK) {
         shared_memory_release(&shared);
         map_free(&map);
         return EXIT_FAILURE;
