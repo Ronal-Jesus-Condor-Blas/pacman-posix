@@ -6,6 +6,7 @@
 #include "../include/common.h"
 #include "../include/map.h"
 #include "../include/movement.h"
+#include "../include/shared.h"
 
 typedef struct {
     const char *file_name;
@@ -20,7 +21,7 @@ static int parse_max_ticks(const char *text, long *max_ticks)
 
     errno = 0;
     value = strtol(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || value <= 0) {
+    if (errno != 0 || end == text || *end != '\0' || value <= 0 || value > INT_MAX) {
         return PACMAN_ERROR;
     }
 
@@ -72,6 +73,7 @@ int main(int argc, char *argv[])
 {
     long max_ticks = 0;
     Map map = {0};
+    SharedMemory shared = {0};
     MovementInput movement_inputs[] = {
         {"pacman_moves.txt", "pacman_moves.txt", {0}},
         {"ghost_1_moves.txt", "ghost_1_moves.txt", {0}},
@@ -107,6 +109,25 @@ int main(int argc, char *argv[])
     map_print(&map);
     print_initial_positions(&map);
     print_movement_counts(movement_inputs, movement_count);
+
+    if (shared_memory_create(&shared) != PACMAN_OK) {
+        map_free(&map);
+        return EXIT_FAILURE;
+    }
+
+    if (shared_state_initialize(shared.state, &map, (int)max_ticks) != PACMAN_OK) {
+        shared_memory_release(&shared);
+        map_free(&map);
+        return EXIT_FAILURE;
+    }
+    shared.sync_initialized = 1;
+
+    shared_state_print_summary(shared.state);
+
+    if (shared_memory_release(&shared) != PACMAN_OK) {
+        map_free(&map);
+        return EXIT_FAILURE;
+    }
 
     map_free(&map);
     return EXIT_SUCCESS;

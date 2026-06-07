@@ -4,6 +4,10 @@
 #include <stddef.h>
 
 #define PACMAN_GHOST_COUNT 4
+#define PACMAN_MAX_MAP_ROWS 64
+#define PACMAN_MAX_MAP_COLS 64
+#define PACMAN_INITIAL_LIVES 3
+#define PACMAN_DEFAULT_PRIORITY 1
 
 typedef struct {
     int row;
