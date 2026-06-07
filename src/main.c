@@ -6,6 +6,7 @@
 #include "../include/common.h"
 #include "../include/map.h"
 #include "../include/movement.h"
+#include "../include/scheduler.h"
 #include "../include/shared.h"
 
 typedef struct {
@@ -74,6 +75,7 @@ int main(int argc, char *argv[])
     long max_ticks = 0;
     Map map = {0};
     SharedMemory shared = {0};
+    Scheduler scheduler = {0};
     MovementInput movement_inputs[] = {
         {"pacman_moves.txt", "pacman_moves.txt", {0}},
         {"ghost_1_moves.txt", "ghost_1_moves.txt", {0}},
@@ -123,6 +125,13 @@ int main(int argc, char *argv[])
     shared.sync_initialized = 1;
 
     shared_state_print_summary(shared.state);
+
+    scheduler_init(&scheduler, shared.state);
+    if (scheduler_run_dry(&scheduler) != PACMAN_OK) {
+        shared_memory_release(&shared);
+        map_free(&map);
+        return EXIT_FAILURE;
+    }
 
     if (shared_memory_release(&shared) != PACMAN_OK) {
         map_free(&map);

@@ -231,10 +231,10 @@ int shared_state_initialize(shared_state_t *state, const Map *map, int max_ticks
     state->collision_detected = 0;
     state->collision_tick = -1;
     state->collision_ghost_id = -1;
-    state->prioridad_pacman = PACMAN_DEFAULT_PRIORITY;
-    state->prioridad_enemy = PACMAN_DEFAULT_PRIORITY;
-    state->pending_priority_pacman = PACMAN_DEFAULT_PRIORITY;
-    state->pending_priority_enemy = PACMAN_DEFAULT_PRIORITY;
+    state->prioridad_pacman = DEFAULT_PACMAN_PRIORITY;
+    state->prioridad_enemy = DEFAULT_ENEMY_PRIORITY;
+    state->pending_priority_pacman = DEFAULT_PACMAN_PRIORITY;
+    state->pending_priority_enemy = DEFAULT_ENEMY_PRIORITY;
     state->priority_request_active = 0;
     state->enemy_priority_request_active = 0;
 
