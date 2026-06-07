@@ -1,4 +1,5 @@
 #include "../include/processes.h"
+#include "../include/pacman.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -126,13 +127,9 @@ static int child_loop(shared_state_t *state,
     return PACMAN_OK;
 }
 
-static void run_pacman_process(shared_state_t *state)
+static void run_pacman_process(shared_state_t *state, const char *case_dir)
 {
-    int status = child_loop(state,
-                            &state->sem_pacman_turn,
-                            &state->sem_p1_done,
-                            "P1",
-                            "pacman_process");
+    int status = pacman_process_run(state, case_dir);
     _exit(status == PACMAN_OK ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
@@ -180,7 +177,7 @@ static int wait_one_child(pid_t pid, const char *label)
     return PACMAN_ERROR;
 }
 
-int processes_start(shared_state_t *state, ProcessHandles *handles)
+int processes_start(shared_state_t *state, const char *case_dir, ProcessHandles *handles)
 {
     pid_t pid;
 
@@ -195,7 +192,7 @@ int processes_start(shared_state_t *state, ProcessHandles *handles)
         return PACMAN_ERROR;
     }
     if (pid == 0) {
-        run_pacman_process(state);
+        run_pacman_process(state, case_dir);
     }
     handles->pacman_pid = pid;
 

@@ -132,7 +132,7 @@ int main(int argc, char *argv[])
 
     scheduler_init(&scheduler, shared.state);
 
-    if (processes_start(shared.state, &processes) != PACMAN_OK) {
+    if (processes_start(shared.state, argv[1], &processes) != PACMAN_OK) {
         scheduler_request_shutdown(&scheduler);
         processes_wait(&processes);
         shared_memory_release(&shared);

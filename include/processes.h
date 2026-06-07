@@ -10,7 +10,7 @@ typedef struct {
     pid_t enemy_pid;
 } ProcessHandles;
 
-int processes_start(shared_state_t *state, ProcessHandles *handles);
+int processes_start(shared_state_t *state, const char *case_dir, ProcessHandles *handles);
 int processes_wait(ProcessHandles *handles);
 
 #endif

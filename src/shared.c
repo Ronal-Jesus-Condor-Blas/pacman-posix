@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -176,6 +177,47 @@ static void copy_initial_positions(shared_state_t *state, const Map *map)
     }
 }
 
+static int parse_priority_env(const char *name, int default_value, int *priority)
+{
+    const char *value_text = getenv(name);
+    char *end = NULL;
+    long value;
+
+    if (value_text == NULL || value_text[0] == '\0') {
+        *priority = default_value;
+        return PACMAN_OK;
+    }
+
+    errno = 0;
+    value = strtol(value_text, &end, 10);
+    if (errno != 0 || end == value_text || *end != '\0' ||
+        value < MIN_PRIORITY || value > MAX_PRIORITY) {
+        fprintf(stderr,
+                "Error: %s debe estar entre %d y %d.\n",
+                name,
+                MIN_PRIORITY,
+                MAX_PRIORITY);
+        return PACMAN_ERROR;
+    }
+
+    *priority = (int)value;
+    return PACMAN_OK;
+}
+
+static int load_initial_priorities(int *pacman_priority, int *enemy_priority)
+{
+    if (parse_priority_env("PACMAN_PRIORITY", DEFAULT_PACMAN_PRIORITY, pacman_priority) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    if (parse_priority_env("ENEMY_PRIORITY", DEFAULT_ENEMY_PRIORITY, enemy_priority) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    printf("Prioridades iniciales usadas: pacman=%d enemy=%d\n", *pacman_priority, *enemy_priority);
+    return PACMAN_OK;
+}
+
 int shared_memory_create(SharedMemory *shared)
 {
     int fd;
@@ -221,7 +263,14 @@ int shared_memory_create(SharedMemory *shared)
 
 int shared_state_initialize(shared_state_t *state, const Map *map, int max_ticks)
 {
+    int pacman_priority;
+    int enemy_priority;
+
     memset(state, 0, sizeof(*state));
+
+    if (load_initial_priorities(&pacman_priority, &enemy_priority) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
 
     state->global_tick = 0;
     state->max_ticks = max_ticks;
@@ -231,10 +280,10 @@ int shared_state_initialize(shared_state_t *state, const Map *map, int max_ticks
     state->collision_detected = 0;
     state->collision_tick = -1;
     state->collision_ghost_id = -1;
-    state->prioridad_pacman = DEFAULT_PACMAN_PRIORITY;
-    state->prioridad_enemy = DEFAULT_ENEMY_PRIORITY;
-    state->pending_priority_pacman = DEFAULT_PACMAN_PRIORITY;
-    state->pending_priority_enemy = DEFAULT_ENEMY_PRIORITY;
+    state->prioridad_pacman = pacman_priority;
+    state->prioridad_enemy = enemy_priority;
+    state->pending_priority_pacman = pacman_priority;
+    state->pending_priority_enemy = enemy_priority;
     state->priority_request_active = 0;
     state->enemy_priority_request_active = 0;
 
