@@ -142,6 +142,115 @@ void scheduler_init(Scheduler *scheduler, shared_state_t *state)
 {
     scheduler->state = state;
     scheduler->last_round_robin = SCHEDULER_PROCESS_ENEMY;
+    scheduler->last_processed_collision_tick = -1;
+}
+
+static int set_game_over(shared_state_t *state)
+{
+    if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    state->game_over = 1;
+
+    if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int read_game_over(shared_state_t *state, int *game_over)
+{
+    if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    *game_over = state->game_over;
+
+    if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int decrement_life_for_collision(shared_state_t *state, int *remaining_lives)
+{
+    if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    if (state->pacman_lives > 0) {
+        --state->pacman_lives;
+    }
+    *remaining_lives = state->pacman_lives;
+
+    if (state->pacman_lives <= 0) {
+        state->game_over = 1;
+    }
+
+    if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int clear_collision_event(shared_state_t *state)
+{
+    state->collision_detected = 0;
+    state->collision_tick = -1;
+    state->collision_ghost_id = -1;
+    return PACMAN_OK;
+}
+
+int scheduler_process_collision_events(Scheduler *scheduler)
+{
+    shared_state_t *state = scheduler->state;
+    int collision_detected;
+    int collision_tick;
+    int collision_ghost_id;
+    int should_process = 0;
+
+    if (lock_mutex(&state->collision_mutex, "pthread_mutex_lock collision_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    collision_detected = state->collision_detected;
+    collision_tick = state->collision_tick;
+    collision_ghost_id = state->collision_ghost_id;
+
+    if (collision_detected && collision_tick != scheduler->last_processed_collision_tick) {
+        scheduler->last_processed_collision_tick = collision_tick;
+        should_process = 1;
+    }
+
+    if (collision_detected) {
+        clear_collision_event(state);
+    }
+
+    if (unlock_mutex(&state->collision_mutex, "pthread_mutex_unlock collision_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    if (should_process) {
+        int remaining_lives = 0;
+
+        printf("[P0] colision detectada en tick %d con ghost_%d\n", collision_tick, collision_ghost_id);
+
+        if (decrement_life_for_collision(state, &remaining_lives) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+
+        printf("[P0] vidas restantes=%d\n", remaining_lives);
+
+        if (remaining_lives <= 0) {
+            printf("[P0] Pac-Man sin vidas. game_over=1\n");
+        }
+    }
+
+    return PACMAN_OK;
 }
 
 int scheduler_apply_priority_requests(Scheduler *scheduler)
@@ -230,15 +339,27 @@ int scheduler_run(Scheduler *scheduler)
 
     while (1) {
         SchedulerProcess selected;
+        int game_over;
 
         if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
             return PACMAN_ERROR;
+        }
+
+        if (state->game_over) {
+            if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+                return PACMAN_ERROR;
+            }
+            break;
         }
 
         if (state->global_tick >= state->max_ticks) {
             if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
                 return PACMAN_ERROR;
             }
+            if (set_game_over(state) != PACMAN_OK) {
+                return PACMAN_ERROR;
+            }
+            printf("[P0] max_ticks alcanzado. game_over=1\n");
             break;
         }
 
@@ -263,9 +384,24 @@ int scheduler_run(Scheduler *scheduler)
         if (dispatch_selected_process(state, selected) != PACMAN_OK) {
             return PACMAN_ERROR;
         }
+
+        if (scheduler_process_collision_events(scheduler) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+
+        if (read_game_over(state, &game_over) != PACMAN_OK) {
+            return PACMAN_ERROR;
+        }
+        if (game_over) {
+            break;
+        }
     }
 
     if (scheduler_request_shutdown(scheduler) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    if (scheduler_print_final_summary(state) != PACMAN_OK) {
         return PACMAN_ERROR;
     }
 
@@ -277,13 +413,7 @@ int scheduler_request_shutdown(Scheduler *scheduler)
 {
     shared_state_t *state = scheduler->state;
 
-    if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
-        return PACMAN_ERROR;
-    }
-
-    state->game_over = 1;
-
-    if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+    if (set_game_over(state) != PACMAN_OK) {
         return PACMAN_ERROR;
     }
 
@@ -296,6 +426,40 @@ int scheduler_request_shutdown(Scheduler *scheduler)
     if (post_turn(&state->sem_enemy_turn) != PACMAN_OK) {
         return PACMAN_ERROR;
     }
+
+    return PACMAN_OK;
+}
+
+int scheduler_print_final_summary(shared_state_t *state)
+{
+    int global_tick;
+    int pacman_x;
+    int pacman_y;
+    int pacman_score;
+    int pacman_lives;
+    int game_over;
+
+    if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    global_tick = state->global_tick;
+    pacman_x = state->pacman_x;
+    pacman_y = state->pacman_y;
+    pacman_score = state->pacman_score;
+    pacman_lives = state->pacman_lives;
+    game_over = state->game_over;
+
+    if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+
+    printf("[P0] Resumen final:\n");
+    printf("  ticks ejecutados=%d\n", global_tick);
+    printf("  pacman=(%d,%d)\n", pacman_x, pacman_y);
+    printf("  score=%d\n", pacman_score);
+    printf("  lives=%d\n", pacman_lives);
+    printf("  game_over=%d\n", game_over);
 
     return PACMAN_OK;
 }

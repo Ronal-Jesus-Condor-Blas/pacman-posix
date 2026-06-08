@@ -11,6 +11,7 @@ typedef enum {
 typedef struct {
     shared_state_t *state;
     SchedulerProcess last_round_robin;
+    int last_processed_collision_tick;
 } Scheduler;
 
 void scheduler_init(Scheduler *scheduler, shared_state_t *state);
@@ -19,6 +20,8 @@ int scheduler_select_next_process(Scheduler *scheduler, SchedulerProcess *select
 int scheduler_run_dry(Scheduler *scheduler);
 int scheduler_run(Scheduler *scheduler);
 int scheduler_request_shutdown(Scheduler *scheduler);
+int scheduler_process_collision_events(Scheduler *scheduler);
+int scheduler_print_final_summary(shared_state_t *state);
 int scheduler_print_tick_log(shared_state_t *state, SchedulerProcess selected);
 const char *scheduler_process_name(SchedulerProcess process);
 
