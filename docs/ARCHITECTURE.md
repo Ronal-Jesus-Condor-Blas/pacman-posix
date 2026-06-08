@@ -1,79 +1,179 @@
 # Arquitectura del proyecto
 
+El proyecto implementa una simulacion concurrente de Pac-Man en C usando procesos,
+threads y mecanismos de sincronizacion POSIX. La arquitectura actual contiene tres
+procesos: P0, P1 y P2. El renderer P3 no esta implementado.
+
 ## P0 - scheduler_process
 
+P0 corresponde al proceso principal. Centraliza el scheduler en su flujo principal;
+no tiene `tick_thread`, `scheduler_thread` ni `signal_thread`.
+
 Responsabilidades:
-- Inicializar memoria compartida.
-- Leer y validar map.txt.
-- Inicializar mutex y semáforos POSIX.
-- Crear P1 y P2 con fork().
-- Controlar global_tick.
-- Decidir qué proceso ejecuta según prioridades.
+
+- Leer argumentos de ejecucion: `./pacman <case_dir> <max_ticks>`.
+- Leer y validar `map.txt`.
+- Leer y validar archivos de movimientos.
+- Crear memoria compartida POSIX con `shm_open()`.
+- Ajustar tamano con `ftruncate()`.
+- Mapear memoria con `mmap()`.
+- Inicializar semaforos y mutexes POSIX.
+- Crear P1 y P2 con `fork()`.
+- Administrar `global_tick` y `max_ticks`.
+- Procesar solicitudes `SET_PRIORITY`.
+- Seleccionar el proceso que recibe turno segun prioridad.
 - Resolver empates con Round Robin.
-- Procesar solicitudes SET_PRIORITY.
-- Procesar eventos de colisión.
-- Actualizar vidas y game_over.
+- Coordinar turnos con `sem_post()` y `sem_wait()`.
+- Procesar eventos de colision publicados por P2.
+- Descontar `pacman_lives`.
+- Establecer `game_over`.
+- Desbloquear hijos al finalizar.
+- Esperar P1 y P2 con `waitpid()`.
+- Liberar recursos POSIX.
+
+P0 es el unico responsable de modificar `pacman_lives` y de controlar
+`game_over`, excepto por la inicializacion realizada al preparar la memoria
+compartida.
 
 ## P1 - pacman_process
 
-Hilos recomendados:
-- movement_reader_thread.
-- movement_executor_thread.
-- pacman_publisher_thread.
+P1 se crea con `fork()` y ejecuta threads internos:
+
+- `movement_reader_thread`
+- `movement_executor_thread`
+- `pacman_publisher_thread`
 
 Responsabilidades:
-- Leer pacman_moves.txt.
-- Mover a Pac-Man cuando P0 le da turno.
-- Validar movimientos contra map_grid.
-- Publicar posición y score en memoria compartida.
-- Solicitar cambios de prioridad mediante buzón.
+
+- Leer `pacman_moves.txt`.
+- Mantener una cola local de instrucciones protegida por mutex.
+- Consumir como maximo una instruccion por turno autorizado.
+- Validar movimientos contra limites del mapa y paredes `X`.
+- Mantener posicion local de Pac-Man.
+- Publicar `pacman_x`, `pacman_y` y `pacman_score` en memoria compartida.
+- Solicitar cambios de prioridad escribiendo:
+  - `pending_priority_pacman`
+  - `priority_request_active`
+- Leer `game_over` para finalizar ordenadamente.
+
+P1 no modifica `pacman_lives` ni decide `game_over`.
 
 ## P2 - enemy_process
 
-Hilos recomendados:
-- enemy_controller_thread.
-- ghost_thread_1.
-- ghost_thread_2.
-- ghost_thread_3.
-- ghost_thread_4.
-- pacman_tracker_thread.
-- collision_thread.
+P2 se crea con `fork()` y ejecuta threads internos:
+
+- `enemy_controller_thread`
+- `ghost_thread_1`
+- `ghost_thread_2`
+- `ghost_thread_3`
+- `ghost_thread_4`
+- `pacman_tracker_thread`
+- `collision_thread`
 
 Responsabilidades:
-- Leer movimientos de ghost_1_moves.txt a ghost_4_moves.txt.
-- Mover fantasmas cuando P0 da turno a P2.
-- Mantener posiciones internas de fantasmas.
-- Leer posición de Pac-Man desde memoria compartida.
+
+- Leer `ghost_1_moves.txt` a `ghost_4_moves.txt`.
+- Permitir que cada fantasma consuma como maximo una instruccion por turno de P2.
+- Validar movimientos contra limites del mapa y paredes `X`.
+- Mantener posiciones locales de los fantasmas.
+- Leer la posicion publicada de Pac-Man.
 - Detectar colisiones.
-- Publicar eventos de colisión.
-- Solicitar cambios de prioridad mediante buzón.
+- Publicar eventos de colision:
+  - `collision_detected`
+  - `collision_tick`
+  - `collision_ghost_id`
+- Solicitar cambios de prioridad escribiendo:
+  - `pending_priority_enemy`
+  - `enemy_priority_request_active`
+- Leer `game_over` para finalizar ordenadamente.
+
+P2 no modifica `pacman_lives` ni decide `game_over`.
 
 ## Memoria compartida
 
-Debe contener:
-- global_tick.
-- max_ticks.
-- game_over.
-- pacman_x.
-- pacman_y.
-- pacman_score.
-- pacman_lives.
-- collision_detected.
-- collision_tick.
-- collision_ghost_id.
-- prioridad_pacman.
-- prioridad_enemy.
-- pending_priority_pacman.
-- priority_request_active.
-- pending_priority_enemy.
-- enemy_priority_request_active.
-- map_grid.
+La estructura `shared_state_t` contiene:
 
-## Sincronización
+- `global_tick`
+- `max_ticks`
+- `game_over`
+- `pacman_x`
+- `pacman_y`
+- `pacman_score`
+- `pacman_lives`
+- `ghost_x[]`
+- `ghost_y[]`
+- `collision_detected`
+- `collision_tick`
+- `collision_ghost_id`
+- `prioridad_pacman`
+- `prioridad_enemy`
+- `pending_priority_pacman`
+- `priority_request_active`
+- `pending_priority_enemy`
+- `enemy_priority_request_active`
+- `map_rows`
+- `map_cols`
+- `map_grid`
+- semaforos compartidos
+- mutexes compartidos
 
-Usar:
-- sem_pacman_turn.
-- sem_enemy_turn.
-- sem_p1_done.
-- sem_p2_done.
-- pthread_mutex_t con PTHREAD_PROCESS_SHARED para memoria compartida.
+La memoria compartida se administra con:
+
+- `shm_open()`
+- `ftruncate()`
+- `mmap()`
+- `munmap()`
+- `shm_unlink()`
+
+## Sincronizacion
+
+Semaforos compartidos:
+
+- `sem_pacman_turn`: P0 autoriza turno de P1.
+- `sem_enemy_turn`: P0 autoriza turno de P2.
+- `sem_p1_done`: P1 confirma fin de turno.
+- `sem_p2_done`: P2 confirma fin de turno.
+
+Mutexes compartidos:
+
+- `state_mutex`: protege estado general.
+- `priority_mutex`: protege prioridades y buzones de solicitud.
+- `collision_mutex`: protege eventos de colision.
+
+P1 y P2 tambien usan mutexes y semaforos internos no compartidos para coordinar sus
+threads locales.
+
+## Scheduler y prioridades
+
+Prioridades por defecto:
+
+- Pac-Man: 20.
+- Enemy: 30.
+
+Las prioridades pueden sobrescribirse con variables de entorno:
+
+```bash
+PACMAN_PRIORITY=40 ENEMY_PRIORITY=30 ./pacman cases/Caso1 10
+```
+
+Las solicitudes `SET_PRIORITY <numero>` no modifican prioridades directamente. P1
+y P2 escriben solicitudes pendientes en memoria compartida, y P0 las valida y
+aplica al inicio del siguiente tick. El rango valido es de 0 a 100.
+
+Si las prioridades son iguales, P0 aplica desempate Round Robin alternando entre
+P1 y P2.
+
+## Colisiones y vidas
+
+P2 solo publica eventos de colision. P0 consume esos eventos despues de cada turno
+confirmado por P1 o P2. Para evitar procesar dos veces el mismo evento, P0 mantiene
+`last_processed_collision_tick`.
+
+Cuando P0 procesa una colision:
+
+1. Lee `collision_tick` y `collision_ghost_id`.
+2. Decrementa `pacman_lives`.
+3. Limpia el evento de colision.
+4. Si las vidas llegan a 0, establece `game_over=1`.
+
+Pac-Man inicia con 3 vidas.
