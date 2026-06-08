@@ -19,15 +19,21 @@ La arquitectura usa tres procesos principales:
 - `P1` o `pacman_process`: proceso hijo responsable de Pac-Man.
 - `P2` o `enemy_process`: proceso hijo responsable de los fantasmas.
 
-P0 centraliza el scheduler en su proceso principal. No existen `tick_thread`,
-`scheduler_thread` ni `signal_thread` en P0. El scheduler avanza por ticks, decide
-que proceso recibe turno, procesa cambios de prioridad solicitados por buzon,
-consume eventos de colision publicados por P2, descuenta vidas, decide `game_over`
-y espera a los hijos con `waitpid()`.
+P0 implementa el scheduler mediante threads internos POSIX. El flujo de P0 se
+divide en avance de ticks, seleccion de proceso, senalizacion de turnos y gestion
+de colisiones. P0 sigue siendo el unico responsable de aplicar prioridades,
+descontar vidas, decidir `game_over` y esperar a los hijos con `waitpid()`.
 
 ## Procesos e hilos
 
 ### P0 - scheduler_process
+
+P0 usa cuatro threads internos POSIX:
+
+- `tick_thread`
+- `scheduler_thread`
+- `signal_thread`
+- `collision_manager_thread`
 
 Responsabilidades actuales:
 
@@ -35,15 +41,21 @@ Responsabilidades actuales:
 - Crear memoria compartida POSIX.
 - Inicializar semaforos y mutexes POSIX.
 - Crear P1 y P2 usando `fork()`.
-- Administrar `global_tick`, `max_ticks`, prioridades y Round Robin.
-- Otorgar turnos con `sem_post()`.
-- Esperar fin de turno con `sem_wait()`.
-- Procesar `collision_detected`, `collision_tick` y `collision_ghost_id`.
-- Descontar `pacman_lives`.
-- Establecer `game_over`.
+- Administrar `global_tick` y `max_ticks` desde `tick_thread`.
+- Procesar prioridades y Round Robin desde `scheduler_thread`.
+- Otorgar turnos con `sem_post()` desde `signal_thread`.
+- Esperar fin de turno con `sem_wait()` desde `signal_thread`.
+- Procesar `collision_detected`, `collision_tick` y `collision_ghost_id` desde
+  `collision_manager_thread`.
+- Descontar `pacman_lives` desde P0.
+- Establecer `game_over` desde P0.
 - Desbloquear procesos hijos al finalizar.
 - Esperar hijos con `waitpid()`.
 - Liberar memoria compartida con `munmap()`, `close()` y `shm_unlink()`.
+
+`collision_manager_thread` existe para mantener separada la gestion de eventos de
+colision respecto de la senalizacion de turnos. P2 solo publica eventos; P0 los
+consume, limpia y traduce en vidas o fin de juego.
 
 ### P1 - pacman_process
 
@@ -308,8 +320,8 @@ Interpretacion:
 - No se usa `ncurses`.
 - No hay interfaz visual interactiva.
 - La salida se presenta mediante logs en consola.
-- P0 centraliza el scheduler en el flujo principal del proceso, sin threads
-  internos propios.
+- P0 no implementa hilos de renderizado ni interfaz visual; sus threads internos
+  se limitan a ticks, planificacion, senalizacion y colisiones.
 
 ## Conclusion
 

@@ -1,7 +1,24 @@
 #include "../include/scheduler.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
+
+typedef struct {
+    Scheduler *scheduler;
+    pthread_mutex_t mutex;
+    pthread_cond_t tick_available;
+    pthread_cond_t selection_available;
+    pthread_cond_t turn_completed;
+    pthread_cond_t collision_completed;
+    int tick_ready;
+    int selection_ready;
+    int turn_done;
+    int collision_done;
+    int shutdown_requested;
+    int thread_error;
+    SchedulerProcess selected_process;
+} SchedulerRuntime;
 
 static int lock_mutex(pthread_mutex_t *mutex, const char *name)
 {
@@ -27,6 +44,104 @@ static int unlock_mutex(pthread_mutex_t *mutex, const char *name)
     }
 
     return PACMAN_OK;
+}
+
+static int init_local_mutex(pthread_mutex_t *mutex, const char *name)
+{
+    int result = pthread_mutex_init(mutex, NULL);
+
+    if (result != 0) {
+        errno = result;
+        perror(name);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int init_local_cond(pthread_cond_t *cond, const char *name)
+{
+    int result = pthread_cond_init(cond, NULL);
+
+    if (result != 0) {
+        errno = result;
+        perror(name);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int wait_local_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, const char *name)
+{
+    int result = pthread_cond_wait(cond, mutex);
+
+    if (result != 0) {
+        errno = result;
+        perror(name);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int signal_local_cond(pthread_cond_t *cond, const char *name)
+{
+    int result = pthread_cond_signal(cond);
+
+    if (result != 0) {
+        errno = result;
+        perror(name);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int broadcast_local_cond(pthread_cond_t *cond, const char *name)
+{
+    int result = pthread_cond_broadcast(cond);
+
+    if (result != 0) {
+        errno = result;
+        perror(name);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static void runtime_broadcast_all(SchedulerRuntime *runtime)
+{
+    broadcast_local_cond(&runtime->tick_available, "pthread_cond_broadcast tick_available");
+    broadcast_local_cond(&runtime->selection_available, "pthread_cond_broadcast selection_available");
+    broadcast_local_cond(&runtime->turn_completed, "pthread_cond_broadcast turn_completed");
+    broadcast_local_cond(&runtime->collision_completed, "pthread_cond_broadcast collision_completed");
+}
+
+static void runtime_request_shutdown(SchedulerRuntime *runtime)
+{
+    if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+        return;
+    }
+
+    runtime->shutdown_requested = 1;
+    runtime_broadcast_all(runtime);
+
+    unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+}
+
+static void runtime_mark_error(SchedulerRuntime *runtime)
+{
+    if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+        return;
+    }
+
+    runtime->thread_error = 1;
+    runtime->shutdown_requested = 1;
+    runtime_broadcast_all(runtime);
+
+    unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
 }
 
 static int wait_done(sem_t *done_sem)
@@ -253,6 +368,363 @@ int scheduler_process_collision_events(Scheduler *scheduler)
     return PACMAN_OK;
 }
 
+static int runtime_init(SchedulerRuntime *runtime, Scheduler *scheduler)
+{
+    runtime->scheduler = scheduler;
+    runtime->tick_ready = 0;
+    runtime->selection_ready = 0;
+    runtime->turn_done = 0;
+    runtime->collision_done = 0;
+    runtime->shutdown_requested = 0;
+    runtime->thread_error = 0;
+    runtime->selected_process = SCHEDULER_PROCESS_PACMAN;
+
+    if (init_local_mutex(&runtime->mutex, "pthread_mutex_init scheduler runtime") != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
+    if (init_local_cond(&runtime->tick_available, "pthread_cond_init tick_available") != PACMAN_OK) {
+        pthread_mutex_destroy(&runtime->mutex);
+        return PACMAN_ERROR;
+    }
+    if (init_local_cond(&runtime->selection_available, "pthread_cond_init selection_available") != PACMAN_OK) {
+        pthread_cond_destroy(&runtime->tick_available);
+        pthread_mutex_destroy(&runtime->mutex);
+        return PACMAN_ERROR;
+    }
+    if (init_local_cond(&runtime->turn_completed, "pthread_cond_init turn_completed") != PACMAN_OK) {
+        pthread_cond_destroy(&runtime->selection_available);
+        pthread_cond_destroy(&runtime->tick_available);
+        pthread_mutex_destroy(&runtime->mutex);
+        return PACMAN_ERROR;
+    }
+    if (init_local_cond(&runtime->collision_completed, "pthread_cond_init collision_completed") != PACMAN_OK) {
+        pthread_cond_destroy(&runtime->turn_completed);
+        pthread_cond_destroy(&runtime->selection_available);
+        pthread_cond_destroy(&runtime->tick_available);
+        pthread_mutex_destroy(&runtime->mutex);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static void runtime_destroy(SchedulerRuntime *runtime)
+{
+    pthread_cond_destroy(&runtime->collision_completed);
+    pthread_cond_destroy(&runtime->turn_completed);
+    pthread_cond_destroy(&runtime->selection_available);
+    pthread_cond_destroy(&runtime->tick_available);
+    pthread_mutex_destroy(&runtime->mutex);
+}
+
+static int create_scheduler_thread(pthread_t *thread,
+                                   void *(*start_routine)(void *),
+                                   SchedulerRuntime *runtime,
+                                   const char *name)
+{
+    int result = pthread_create(thread, NULL, start_routine, runtime);
+
+    if (result != 0) {
+        errno = result;
+        perror(name);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static int join_scheduler_thread(pthread_t thread, const char *name)
+{
+    int result = pthread_join(thread, NULL);
+
+    if (result != 0) {
+        errno = result;
+        perror(name);
+        return PACMAN_ERROR;
+    }
+
+    return PACMAN_OK;
+}
+
+static void *tick_thread(void *arg)
+{
+    SchedulerRuntime *runtime = arg;
+    shared_state_t *state = runtime->scheduler->state;
+
+    printf("[P0] tick_thread iniciado\n");
+
+    while (1) {
+        int should_stop = 0;
+
+        if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (state->game_over) {
+            should_stop = 1;
+        } else if (state->global_tick >= state->max_ticks) {
+            state->game_over = 1;
+            printf("[P0] max_ticks alcanzado. game_over=1\n");
+            should_stop = 1;
+        } else {
+            ++state->global_tick;
+        }
+
+        if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (should_stop) {
+            runtime_request_shutdown(runtime);
+            break;
+        }
+
+        if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        runtime->tick_ready = 1;
+        runtime->selection_ready = 0;
+        runtime->turn_done = 0;
+        runtime->collision_done = 0;
+
+        if (signal_local_cond(&runtime->tick_available, "pthread_cond_signal tick_available") != PACMAN_OK) {
+            unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        while (!runtime->collision_done && !runtime->shutdown_requested && !runtime->thread_error) {
+            if (wait_local_cond(&runtime->collision_completed,
+                                &runtime->mutex,
+                                "pthread_cond_wait collision_completed") != PACMAN_OK) {
+                unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+                runtime_mark_error(runtime);
+                return NULL;
+            }
+        }
+
+        should_stop = runtime->shutdown_requested || runtime->thread_error;
+
+        if (unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (should_stop) {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+static void *scheduler_thread(void *arg)
+{
+    SchedulerRuntime *runtime = arg;
+    Scheduler *scheduler = runtime->scheduler;
+    shared_state_t *state = scheduler->state;
+
+    printf("[P0] scheduler_thread iniciado\n");
+
+    while (1) {
+        SchedulerProcess selected;
+
+        if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        while (!runtime->tick_ready && !runtime->shutdown_requested && !runtime->thread_error) {
+            if (wait_local_cond(&runtime->tick_available,
+                                &runtime->mutex,
+                                "pthread_cond_wait tick_available") != PACMAN_OK) {
+                unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+                runtime_mark_error(runtime);
+                return NULL;
+            }
+        }
+
+        if (runtime->shutdown_requested || runtime->thread_error) {
+            unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+            break;
+        }
+
+        runtime->tick_ready = 0;
+
+        if (unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (scheduler_apply_priority_requests(scheduler) != PACMAN_OK ||
+            scheduler_select_next_process(scheduler, &selected) != PACMAN_OK ||
+            scheduler_print_tick_log(state, selected) != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        runtime->selected_process = selected;
+        runtime->selection_ready = 1;
+
+        if (signal_local_cond(&runtime->selection_available,
+                              "pthread_cond_signal selection_available") != PACMAN_OK) {
+            unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+    }
+
+    return NULL;
+}
+
+static void *signal_thread(void *arg)
+{
+    SchedulerRuntime *runtime = arg;
+    shared_state_t *state = runtime->scheduler->state;
+
+    printf("[P0] signal_thread iniciado\n");
+
+    while (1) {
+        SchedulerProcess selected;
+
+        if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        while (!runtime->selection_ready && !runtime->shutdown_requested && !runtime->thread_error) {
+            if (wait_local_cond(&runtime->selection_available,
+                                &runtime->mutex,
+                                "pthread_cond_wait selection_available") != PACMAN_OK) {
+                unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+                runtime_mark_error(runtime);
+                return NULL;
+            }
+        }
+
+        if (runtime->shutdown_requested || runtime->thread_error) {
+            unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+            break;
+        }
+
+        selected = runtime->selected_process;
+        runtime->selection_ready = 0;
+
+        if (unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (dispatch_selected_process(state, selected) != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        runtime->turn_done = 1;
+
+        if (signal_local_cond(&runtime->turn_completed, "pthread_cond_signal turn_completed") != PACMAN_OK) {
+            unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+    }
+
+    return NULL;
+}
+
+static void *collision_manager_thread(void *arg)
+{
+    SchedulerRuntime *runtime = arg;
+    Scheduler *scheduler = runtime->scheduler;
+    shared_state_t *state = scheduler->state;
+
+    printf("[P0] collision_manager_thread iniciado\n");
+
+    while (1) {
+        int game_over;
+
+        if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        while (!runtime->turn_done && !runtime->shutdown_requested && !runtime->thread_error) {
+            if (wait_local_cond(&runtime->turn_completed,
+                                &runtime->mutex,
+                                "pthread_cond_wait turn_completed") != PACMAN_OK) {
+                unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+                runtime_mark_error(runtime);
+                return NULL;
+            }
+        }
+
+        if (runtime->shutdown_requested || runtime->thread_error) {
+            unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+            break;
+        }
+
+        runtime->turn_done = 0;
+
+        if (unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (scheduler_process_collision_events(scheduler) != PACMAN_OK ||
+            read_game_over(state, &game_over) != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (lock_mutex(&runtime->mutex, "pthread_mutex_lock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        runtime->collision_done = 1;
+        if (game_over) {
+            runtime->shutdown_requested = 1;
+            runtime_broadcast_all(runtime);
+        } else if (signal_local_cond(&runtime->collision_completed,
+                                     "pthread_cond_signal collision_completed") != PACMAN_OK) {
+            unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime");
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+
+        if (unlock_mutex(&runtime->mutex, "pthread_mutex_unlock scheduler runtime") != PACMAN_OK) {
+            runtime_mark_error(runtime);
+            return NULL;
+        }
+    }
+
+    return NULL;
+}
+
 int scheduler_apply_priority_requests(Scheduler *scheduler)
 {
     shared_state_t *state = scheduler->state;
@@ -334,79 +806,93 @@ int scheduler_run_dry(Scheduler *scheduler)
 int scheduler_run(Scheduler *scheduler)
 {
     shared_state_t *state = scheduler->state;
+    SchedulerRuntime runtime;
+    pthread_t tick_thread_id;
+    pthread_t scheduler_thread_id;
+    pthread_t signal_thread_id;
+    pthread_t collision_thread_id;
+    int tick_created = 0;
+    int scheduler_created = 0;
+    int signal_created = 0;
+    int collision_created = 0;
+    int status = PACMAN_OK;
 
     printf("[P0] Scheduler P0 iniciado.\n");
 
-    while (1) {
-        SchedulerProcess selected;
-        int game_over;
+    if (runtime_init(&runtime, scheduler) != PACMAN_OK) {
+        return PACMAN_ERROR;
+    }
 
-        if (lock_mutex(&state->state_mutex, "pthread_mutex_lock state_mutex") != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
+    if (create_scheduler_thread(&tick_thread_id, tick_thread, &runtime, "pthread_create tick_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+        goto cleanup;
+    }
+    tick_created = 1;
 
-        if (state->game_over) {
-            if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
-                return PACMAN_ERROR;
-            }
-            break;
-        }
+    if (create_scheduler_thread(&scheduler_thread_id,
+                                scheduler_thread,
+                                &runtime,
+                                "pthread_create scheduler_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+        goto cleanup;
+    }
+    scheduler_created = 1;
 
-        if (state->global_tick >= state->max_ticks) {
-            if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
-                return PACMAN_ERROR;
-            }
-            if (set_game_over(state) != PACMAN_OK) {
-                return PACMAN_ERROR;
-            }
-            printf("[P0] max_ticks alcanzado. game_over=1\n");
-            break;
-        }
+    if (create_scheduler_thread(&signal_thread_id,
+                                signal_thread,
+                                &runtime,
+                                "pthread_create signal_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+        goto cleanup;
+    }
+    signal_created = 1;
 
-        ++state->global_tick;
+    if (create_scheduler_thread(&collision_thread_id,
+                                collision_manager_thread,
+                                &runtime,
+                                "pthread_create collision_manager_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+        goto cleanup;
+    }
+    collision_created = 1;
 
-        if (unlock_mutex(&state->state_mutex, "pthread_mutex_unlock state_mutex") != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
+cleanup:
+    if (status != PACMAN_OK) {
+        runtime_request_shutdown(&runtime);
+    }
 
-        if (scheduler_apply_priority_requests(scheduler) != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
+    if (tick_created && join_scheduler_thread(tick_thread_id, "pthread_join tick_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+    }
+    if (scheduler_created && join_scheduler_thread(scheduler_thread_id, "pthread_join scheduler_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+    }
+    if (signal_created && join_scheduler_thread(signal_thread_id, "pthread_join signal_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+    }
+    if (collision_created && join_scheduler_thread(collision_thread_id, "pthread_join collision_manager_thread") != PACMAN_OK) {
+        status = PACMAN_ERROR;
+    }
 
-        if (scheduler_select_next_process(scheduler, &selected) != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
-
-        if (scheduler_print_tick_log(state, selected) != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
-
-        if (dispatch_selected_process(state, selected) != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
-
-        if (scheduler_process_collision_events(scheduler) != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
-
-        if (read_game_over(state, &game_over) != PACMAN_OK) {
-            return PACMAN_ERROR;
-        }
-        if (game_over) {
-            break;
-        }
+    if (runtime.thread_error) {
+        status = PACMAN_ERROR;
     }
 
     if (scheduler_request_shutdown(scheduler) != PACMAN_OK) {
-        return PACMAN_ERROR;
+        status = PACMAN_ERROR;
     }
 
     if (scheduler_print_final_summary(state) != PACMAN_OK) {
-        return PACMAN_ERROR;
+        status = PACMAN_ERROR;
+    }
+
+    if (status == PACMAN_OK) {
+        printf("[P0] threads de scheduler finalizados correctamente\n");
     }
 
     printf("[P0] Scheduler P0 finalizado.\n");
-    return PACMAN_OK;
+    runtime_destroy(&runtime);
+    return status;
 }
 
 int scheduler_request_shutdown(Scheduler *scheduler)

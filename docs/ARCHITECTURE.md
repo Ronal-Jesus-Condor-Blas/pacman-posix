@@ -6,8 +6,24 @@ procesos: P0, P1 y P2. El renderer P3 no esta implementado.
 
 ## P0 - scheduler_process
 
-P0 corresponde al proceso principal. Centraliza el scheduler en su flujo principal;
-no tiene `tick_thread`, `scheduler_thread` ni `signal_thread`.
+P0 corresponde al proceso principal. Implementa el scheduler con threads internos
+POSIX y mantiene la autoridad sobre ticks, seleccion de turnos, vidas y
+finalizacion del juego.
+
+Threads internos de P0:
+
+- `tick_thread`: incrementa `global_tick`, controla `max_ticks` y solicita el fin
+  del juego cuando se alcanza el limite de ticks.
+- `scheduler_thread`: procesa solicitudes `SET_PRIORITY`, valida rangos, compara
+  prioridades y aplica Round Robin cuando hay empate.
+- `signal_thread`: entrega el turno al proceso seleccionado con `sem_post()` y
+  espera la confirmacion con `sem_wait()`.
+- `collision_manager_thread`: consume eventos de colision publicados por P2,
+  descuenta vidas, limpia el evento y establece `game_over` si las vidas llegan a
+  cero.
+
+`collision_manager_thread` se mantiene separado para que P0 procese colisiones sin
+mezclar esa responsabilidad con la senalizacion de turnos.
 
 Responsabilidades:
 
@@ -19,12 +35,13 @@ Responsabilidades:
 - Mapear memoria con `mmap()`.
 - Inicializar semaforos y mutexes POSIX.
 - Crear P1 y P2 con `fork()`.
-- Administrar `global_tick` y `max_ticks`.
-- Procesar solicitudes `SET_PRIORITY`.
+- Administrar `global_tick` y `max_ticks` desde `tick_thread`.
+- Procesar solicitudes `SET_PRIORITY` desde `scheduler_thread`.
 - Seleccionar el proceso que recibe turno segun prioridad.
 - Resolver empates con Round Robin.
 - Coordinar turnos con `sem_post()` y `sem_wait()`.
-- Procesar eventos de colision publicados por P2.
+- Procesar eventos de colision publicados por P2 desde
+  `collision_manager_thread`.
 - Descontar `pacman_lives`.
 - Establecer `game_over`.
 - Desbloquear hijos al finalizar.

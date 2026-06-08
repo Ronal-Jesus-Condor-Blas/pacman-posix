@@ -125,6 +125,32 @@ Resultado observado:
 
 ## Validaciones tecnicas con grep
 
+Verificar creacion de threads POSIX:
+
+```bash
+grep -R --exclude='*.o' "pthread_create" src include
+```
+
+Interpretacion:
+
+- Deben aparecer llamadas en P0 (`src/scheduler.c`), P1 (`src/pacman.c`) y P2
+  (`src/enemy.c`).
+- P0 debe crear `tick_thread`, `scheduler_thread`, `signal_thread` y
+  `collision_manager_thread`.
+
+Verificar threads obligatorios de P0:
+
+```bash
+grep -R --exclude='*.o' "tick_thread\|scheduler_thread\|signal_thread" src include
+grep -R --exclude='*.o' "collision_manager_thread" src include
+```
+
+Interpretacion:
+
+- Los tres threads obligatorios de P0 deben encontrarse en `src/scheduler.c`.
+- `collision_manager_thread` debe encontrarse en `src/scheduler.c` como thread
+  adicional justificado para el consumo de colisiones en P0.
+
 Verificar escrituras sobre vidas:
 
 ```bash
@@ -165,6 +191,8 @@ valgrind --leak-check=full ./pacman cases/Caso1 10
 - El programa acepta `./pacman <case_dir> <max_ticks>`.
 - P0 crea P1 y P2 con `fork()`.
 - P1 y P2 finalizan sin procesos zombies.
+- P0 usa `tick_thread`, `scheduler_thread` y `signal_thread`.
+- P0 usa `collision_manager_thread` para procesar colisiones.
 - P1 usa sus tres threads internos.
 - P2 usa sus siete threads internos.
 - P0 procesa colisiones y descuenta vidas.
